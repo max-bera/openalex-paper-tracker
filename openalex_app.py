@@ -178,7 +178,13 @@ def extract_work_metadata(work: dict) -> dict:
     for authorship in work.get("authorships", []):
         author = authorship.get("author", {})
         name = author.get("display_name", "")
-        authors.append(name)
+        orcid_url = author.get("orcid") or ""
+        # Format as "Name [ORCID]" when available
+        if orcid_url:
+            orcid_id = orcid_url.replace("https://orcid.org/", "")
+            authors.append(f"{name} [{orcid_id}]")
+        else:
+            authors.append(name)
         for inst in authorship.get("institutions", []):
             inst_name = inst.get("display_name", "")
             if inst_name:
@@ -186,6 +192,22 @@ def extract_work_metadata(work: dict) -> dict:
 
     abstract_idx = work.get("abstract_inverted_index")
     abstract_text = reconstruct_abstract(abstract_idx) if abstract_idx else ""
+
+    # Keywords
+    keywords_list = work.get("keywords", []) or []
+    keywords = "; ".join(kw.get("keyword", "") for kw in keywords_list if kw.get("keyword"))
+
+    # Funding / grants
+    grants_list = work.get("grants", []) or []
+    funding_parts = []
+    for grant in grants_list:
+        funder = grant.get("funder_display_name", "") or ""
+        award_id = grant.get("award_id", "") or ""
+        if funder and award_id:
+            funding_parts.append(f"{funder} ({award_id})")
+        elif funder:
+            funding_parts.append(funder)
+    funding = "; ".join(sorted(set(funding_parts)))
 
     topics = work.get("topics", [])
     primary_topic = topics[0] if topics else {}
@@ -210,6 +232,8 @@ def extract_work_metadata(work: dict) -> dict:
         "field": field,
         "subfield": subfield,
         "topic": topic_name,
+        "keywords": keywords,
+        "funding": funding,
         "cited_by_count": work.get("cited_by_count", 0),
         "has_fulltext": work.get("has_fulltext", False),
         "is_oa": oa.get("is_oa", False),
@@ -248,7 +272,8 @@ def search_works(search_term, date_from, date_to, field_filter, polite_email,
             "page": page,
             "select": "id,doi,display_name,publication_date,authorships,"
                       "primary_location,topics,cited_by_count,has_fulltext,"
-                      "open_access,abstract_inverted_index,referenced_works",
+                      "open_access,abstract_inverted_index,referenced_works,"
+                      "keywords,grants",
         }, polite_email)
 
         meta = data.get("meta", {})
@@ -291,7 +316,12 @@ def parse_results(works, search_term, excluded_authors, excluded_terms,
         for authorship in work.get("authorships", []):
             author = authorship.get("author", {})
             name = author.get("display_name", "")
-            authors.append(name)
+            orcid_url = author.get("orcid") or ""
+            if orcid_url:
+                orcid_id = orcid_url.replace("https://orcid.org/", "")
+                authors.append(f"{name} [{orcid_id}]")
+            else:
+                authors.append(name)
             if term_lower in name.lower():
                 term_is_author = True
                 matching_author_names.append(name)
@@ -367,6 +397,24 @@ def parse_results(works, search_term, excluded_authors, excluded_terms,
         journal = source.get("display_name", "")
         oa = work.get("open_access", {}) or {}
 
+        # Keywords
+        keywords_list = work.get("keywords", []) or []
+        keywords = "; ".join(
+            kw.get("keyword", "") for kw in keywords_list if kw.get("keyword")
+        )
+
+        # Funding / grants
+        grants_list = work.get("grants", []) or []
+        funding_parts = []
+        for grant in grants_list:
+            funder = grant.get("funder_display_name", "") or ""
+            award_id = grant.get("award_id", "") or ""
+            if funder and award_id:
+                funding_parts.append(f"{funder} ({award_id})")
+            elif funder:
+                funding_parts.append(funder)
+        funding = "; ".join(sorted(set(funding_parts)))
+
         rows.append({
             "openalex_id": work.get("id", ""),
             "doi": work.get("doi", ""),
@@ -379,6 +427,8 @@ def parse_results(works, search_term, excluded_authors, excluded_terms,
             "field": field,
             "subfield": subfield,
             "topic": topic_name,
+            "keywords": keywords,
+            "funding": funding,
             "cited_by_count": work.get("cited_by_count", 0),
             "has_fulltext": work.get("has_fulltext", False),
             "is_oa": oa.get("is_oa", False),
@@ -403,7 +453,7 @@ def parse_results(works, search_term, excluded_authors, excluded_terms,
 TITLE_SELECT_FIELDS = (
     "id,doi,display_name,publication_date,authorships,"
     "primary_location,topics,cited_by_count,has_fulltext,"
-    "open_access,abstract_inverted_index"
+    "open_access,abstract_inverted_index,keywords,grants"
 )
 
 
@@ -570,7 +620,7 @@ with mode_keyword:
         with kw_col1:
             search_term = st.text_input(
                 "Search term",
-                value="Optics11",
+                value="Pavone",
                 help="Company name, instrument name, or keyword to search for.",
             )
         with kw_col2:
@@ -584,7 +634,7 @@ with mode_keyword:
         dc1, dc2 = st.columns(2)
         with dc1:
             date_from = st.date_input(
-                "From date", value=date(2026, 1, 1),
+                "From date", value=date(2025, 1, 1),
                 min_value=date(2000, 1, 1), max_value=date.today(),
             )
         with dc2:
@@ -601,7 +651,7 @@ with mode_keyword:
         fc1, fc2 = st.columns(2)
         with fc1:
             excluded_terms_text = st.text_area(
-                "Excluded terms (one per line)", value="partial discharge \n FBG",
+                "Excluded terms (one per line)", value="",
                 help="Papers containing these terms in title/abstract are filtered out.",
             )
             excluded_terms = [
@@ -701,6 +751,7 @@ with mode_keyword:
 
         kw_display_cols = [
             "title", "authors", "publication_date", "journal", "field",
+            "keywords", "funding",
             "found_in", "classification", "doi",
         ]
 
@@ -775,7 +826,7 @@ with mode_lookup:
         lc1, lc2 = st.columns(2)
         with lc1:
             title_column = st.text_input(
-                "Title column name", value="Title",
+                "Title column name", value="title",
                 help="Column in your CSV that contains paper titles. "
                      "Case-sensitive. If blank, the first column is used.",
             )
@@ -882,7 +933,7 @@ with mode_lookup:
             lu_core_cols = [
                 "query_title", "match_status", "similarity",
                 "title", "authors", "publication_date", "journal",
-                "field", "doi",
+                "field", "keywords", "funding", "doi",
             ]
             # Detect original CSV columns carried through (anything not from
             # OpenAlex metadata or the lookup pipeline itself)
@@ -890,8 +941,8 @@ with mode_lookup:
                 "query_title", "match_status", "similarity",
                 "openalex_id", "doi", "title", "abstract",
                 "publication_date", "authors", "institutions", "journal",
-                "field", "subfield", "topic", "cited_by_count",
-                "has_fulltext", "is_oa",
+                "field", "subfield", "topic", "keywords", "funding",
+                "cited_by_count", "has_fulltext", "is_oa",
             }
             orig_carried_cols = [
                 c for c in lu_df.columns if c not in oa_cols
