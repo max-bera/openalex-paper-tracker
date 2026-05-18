@@ -270,10 +270,6 @@ def search_works(search_term, date_from, date_to, field_filter, polite_email,
             "filter": combined_filter,
             "per_page": per_page,
             "page": page,
-            "select": "id,doi,display_name,publication_date,authorships,"
-                      "primary_location,topics,cited_by_count,has_fulltext,"
-                      "open_access,abstract_inverted_index,referenced_works,"
-                      "keywords,grants",
         }, polite_email)
 
         meta = data.get("meta", {})
@@ -450,22 +446,16 @@ def parse_results(works, search_term, excluded_authors, excluded_terms,
 #  TITLE LOOKUP pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
-TITLE_SELECT_FIELDS = (
-    "id,doi,display_name,publication_date,authorships,"
-    "primary_location,topics,cited_by_count,has_fulltext,"
-    "open_access,abstract_inverted_index,keywords,grants"
-)
-
-
 def lookup_single_title(query_title: str, polite_email: str) -> dict:
     """
     Search OpenAlex for a single title using title.search filter.
     Returns the best match with similarity score, or a NOT_FOUND row.
     """
     try:
+        # Sanitize title: remove quotes and characters that break the filter syntax
+        safe_title = query_title.replace('"', '').replace('\\', '')
         data = openalex_get("works", {
-            "filter": f'title.search:"{query_title}"',
-            "select": TITLE_SELECT_FIELDS,
+            "filter": f'title.search:"{safe_title}"',
             "per_page": 5,
         }, polite_email)
     except Exception as e:
