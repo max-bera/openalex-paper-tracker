@@ -226,44 +226,96 @@ def extract_work_metadata(work: dict) -> dict:
 
 # Ordered longest-first so "Piuma Chiaro" is matched before "Piuma" or "Chiaro"
 INSTRUMENT_NAMES = ["Piuma Chiaro", "Piuma", "Chiaro", "Pavone", "Cuore"]
+VICINITY_CHARS = 300  # characters each side of the search term to scan
 
 
-def detect_machine(title: str, abstract: str, search_term: str) -> str:
+def _scan_text_for_instruments(text_lower: str) -> list:
+    """Return list of instrument names found in text (word-boundary matched)."""
+    found = []
+    for instr in INSTRUMENT_NAMES:
+        pattern = r'\b' + re.escape(instr.lower()) + r'\b'
+        if re.search(pattern, text_lower):
+            if instr in ("Piuma", "Chiaro") and "Piuma Chiaro" in found:
+                continue
+            found.append(instr)
+    return found
+
+
+def _fetch_fulltext(url: str, polite_email: str) -> str:
+    """Try to fetch a web page and return its visible text. Returns '' on failure."""
+    if not url:
+        return ""
+    try:
+        headers = {"User-Agent": f"PaperTracker/1.0 (mailto:{polite_email})"}
+        resp = requests.get(url, headers=headers, timeout=15,
+                            allow_redirects=True)
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "")
+        if "pdf" in content_type.lower():
+            return ""  # can't parse PDFs without extra libraries
+        # Strip HTML tags to get plain text
+        text = re.sub(r'<[^>]+>', ' ', resp.text)
+        text = re.sub(r'\s+', ' ', text)
+        return text
+    except Exception:
+        return ""
+
+
+def detect_machine(title: str, abstract: str, search_term: str,
+                   oa_url: str = "", polite_email: str = "") -> str:
     """
-    Look for known instrument names anywhere in the title or abstract.
+    Look for known instrument names, searching progressively wider:
+      1. Vicinity window (±300 chars) around the search term in title+abstract.
+      2. Full title + abstract.
+      3. Fetch the article's open-access full text (HTML only) and scan it.
 
-    Strategy:
-      1. If the search term itself IS an instrument name and appears in
-         title or abstract, return it directly.
-      2. Otherwise, scan the full title + abstract for instrument names
-         using word-boundary matching.
-      3. "Piuma Chiaro" is checked before "Piuma"/"Chiaro" individually so
-         the compound product name takes priority.
+    If the search term itself IS an instrument name, return it when it
+    appears in title or abstract (skip the broader search).
 
     Returns a semicolon-joined string of detected instruments, or "".
     """
-    text_lower = f"{title}  {abstract}".lower()
+    text = f"{title}  {abstract}"
+    text_lower = text.lower()
     term_lower = search_term.lower()
 
-    # Step 1: Is the search term itself an instrument?
+    # ── Shortcut: search term is itself an instrument ─────────────────────
     for instr in INSTRUMENT_NAMES:
         if term_lower == instr.lower():
             if instr.lower() in title.lower() or instr.lower() in abstract.lower():
                 return instr
             return ""
 
-    # Step 2: Scan full text for instrument names (word-boundary match)
-    found = []
-    for instr in INSTRUMENT_NAMES:
-        pattern = r'\b' + re.escape(instr.lower()) + r'\b'
-        if re.search(pattern, text_lower):
-            # If we matched the compound "Piuma Chiaro", don't also add
-            # the individual "Piuma" or "Chiaro"
-            if instr in ("Piuma", "Chiaro") and "Piuma Chiaro" in found:
-                continue
-            found.append(instr)
+    # ── Tier 1: Vicinity windows around the search term ───────────────────
+    windows = []
+    start = 0
+    while True:
+        idx = text_lower.find(term_lower, start)
+        if idx == -1:
+            break
+        win_start = max(0, idx - VICINITY_CHARS)
+        win_end = min(len(text), idx + len(term_lower) + VICINITY_CHARS)
+        windows.append(text_lower[win_start:win_end])
+        start = idx + 1
 
-    return "; ".join(found)
+    if windows:
+        found = _scan_text_for_instruments(" ".join(windows))
+        if found:
+            return "; ".join(found)
+
+    # ── Tier 2: Full title + abstract ─────────────────────────────────────
+    found = _scan_text_for_instruments(text_lower)
+    if found:
+        return "; ".join(found)
+
+    # ── Tier 3: Fetch OA full text (HTML pages only) ──────────────────────
+    if oa_url:
+        fulltext = _fetch_fulltext(oa_url, polite_email)
+        if fulltext:
+            found = _scan_text_for_instruments(fulltext.lower())
+            if found:
+                return "; ".join(found)
+
+    return ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -419,8 +471,10 @@ def parse_results(works, search_term, excluded_authors, excluded_terms,
         journal = source.get("display_name", "")
         oa = work.get("open_access", {}) or {}
 
-        # Detect instrument name near the search term
-        machine = detect_machine(title, abstract_text, search_term)
+        # Detect instrument name (vicinity → title+abstract → OA fulltext)
+        oa_url = oa.get("oa_url", "") or ""
+        machine = detect_machine(title, abstract_text, search_term,
+                                 oa_url=oa_url, polite_email=polite_email)
 
         rows.append({
             "openalex_id": work.get("id", ""),
