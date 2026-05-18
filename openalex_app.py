@@ -241,51 +241,29 @@ def _scan_text_for_instruments(text_lower: str) -> list:
     return found
 
 
-def _fetch_fulltext(url: str, polite_email: str) -> str:
-    """Try to fetch a web page and return its visible text. Returns '' on failure."""
-    if not url:
-        return ""
-    try:
-        headers = {"User-Agent": f"PaperTracker/1.0 (mailto:{polite_email})"}
-        resp = requests.get(url, headers=headers, timeout=15,
-                            allow_redirects=True)
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "")
-        if "pdf" in content_type.lower():
-            return ""  # can't parse PDFs without extra libraries
-        # Strip HTML tags to get plain text
-        text = re.sub(r'<[^>]+>', ' ', resp.text)
-        text = re.sub(r'\s+', ' ', text)
-        return text
-    except Exception:
-        return ""
-
-
-def detect_machine(title: str, abstract: str, search_term: str,
-                   oa_url: str = "", polite_email: str = "") -> str:
+def detect_machine_local(title: str, abstract: str, search_term: str) -> str:
     """
-    Look for known instrument names, searching progressively wider:
-      1. Vicinity window (±300 chars) around the search term in title+abstract.
-      2. Full title + abstract.
-      3. Fetch the article's open-access full text (HTML only) and scan it.
+    Look for instrument names in title+abstract only (no API calls).
 
-    If the search term itself IS an instrument name, return it when it
-    appears in title or abstract (skip the broader search).
+    1. If the search term itself IS an instrument, return it when present
+       in title/abstract.
+    2. Vicinity window (±300 chars) around the search term.
+    3. Full title + abstract.
 
-    Returns a semicolon-joined string of detected instruments, or "".
+    Returns semicolon-joined instruments or "".
     """
     text = f"{title}  {abstract}"
     text_lower = text.lower()
     term_lower = search_term.lower()
 
-    # ── Shortcut: search term is itself an instrument ─────────────────────
+    # Shortcut: search term is itself an instrument
     for instr in INSTRUMENT_NAMES:
         if term_lower == instr.lower():
             if instr.lower() in title.lower() or instr.lower() in abstract.lower():
                 return instr
             return ""
 
-    # ── Tier 1: Vicinity windows around the search term ───────────────────
+    # Tier 1: Vicinity windows
     windows = []
     start = 0
     while True:
@@ -302,20 +280,67 @@ def detect_machine(title: str, abstract: str, search_term: str,
         if found:
             return "; ".join(found)
 
-    # ── Tier 2: Full title + abstract ─────────────────────────────────────
+    # Tier 2: Full title + abstract
     found = _scan_text_for_instruments(text_lower)
     if found:
         return "; ".join(found)
 
-    # ── Tier 3: Fetch OA full text (HTML pages only) ──────────────────────
-    if oa_url:
-        fulltext = _fetch_fulltext(oa_url, polite_email)
-        if fulltext:
-            found = _scan_text_for_instruments(fulltext.lower())
-            if found:
-                return "; ".join(found)
-
     return ""
+
+
+def batch_detect_machines(work_ids: list, polite_email: str) -> dict:
+    """
+    For a list of OpenAlex work IDs, search each instrument name against
+    OpenAlex's fulltext index to see which papers mention which instruments.
+
+    Returns {openalex_id: "Instrument; ..."} for IDs with matches.
+    """
+    if not work_ids:
+        return {}
+
+    # Short IDs for the filter (strip URL prefix)
+    short_ids = [wid.split("/")[-1] if "/" in wid else wid for wid in work_ids]
+
+    # {short_id: set of instrument names}
+    hits = {}
+
+    for instr in INSTRUMENT_NAMES:
+        # Query in chunks of 50 (OpenAlex OR-filter limit)
+        for i in range(0, len(short_ids), 50):
+            chunk = short_ids[i:i + 50]
+            id_filter = "|".join(chunk)
+            try:
+                data = openalex_get("works", {
+                    "search": instr,
+                    "filter": f"openalex:{id_filter}",
+                    "select": "id",
+                    "per_page": 50,
+                }, polite_email)
+                for result in data.get("results", []):
+                    rid = result.get("id", "")
+                    short = rid.split("/")[-1] if "/" in rid else rid
+                    if short not in hits:
+                        hits[short] = set()
+                    hits[short].add(instr)
+                time.sleep(0.15)
+            except Exception:
+                pass
+
+    # Build final strings, applying compound-name priority
+    result = {}
+    for short, instruments in hits.items():
+        # Find the full ID
+        full_id = next((wid for wid in work_ids
+                        if wid.endswith(short)), short)
+        # If "Piuma Chiaro" matched, drop individual "Piuma" / "Chiaro"
+        if "Piuma Chiaro" in instruments:
+            instruments.discard("Piuma")
+            instruments.discard("Chiaro")
+        # Preserve the canonical order from INSTRUMENT_NAMES
+        ordered = [i for i in INSTRUMENT_NAMES if i in instruments]
+        result[full_id] = "; ".join(ordered)
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -471,10 +496,8 @@ def parse_results(works, search_term, excluded_authors, excluded_terms,
         journal = source.get("display_name", "")
         oa = work.get("open_access", {}) or {}
 
-        # Detect instrument name (vicinity → title+abstract → OA fulltext)
-        oa_url = oa.get("oa_url", "") or ""
-        machine = detect_machine(title, abstract_text, search_term,
-                                 oa_url=oa_url, polite_email=polite_email)
+        # Detect instrument name in title + abstract (vicinity → full)
+        machine = detect_machine_local(title, abstract_text, search_term)
 
         rows.append({
             "openalex_id": work.get("id", ""),
@@ -503,6 +526,20 @@ def parse_results(works, search_term, excluded_authors, excluded_terms,
             progress_callback(i + 1, len(works))
 
     df = pd.DataFrame(rows)
+
+    # ── Batch fulltext search for papers with no machine detected yet ─────
+    if not df.empty:
+        no_machine = df[df["machine"] == ""]
+        if not no_machine.empty:
+            fulltext_hits = batch_detect_machines(
+                no_machine["openalex_id"].tolist(), polite_email,
+            )
+            if fulltext_hits:
+                df["machine"] = df.apply(
+                    lambda r: r["machine"] if r["machine"]
+                    else fulltext_hits.get(r["openalex_id"], ""),
+                    axis=1,
+                )
     return df, signal_classes
 
 
