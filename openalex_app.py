@@ -1,9 +1,9 @@
 """
 OpenAlex Paper Tracker — Streamlit App
 
-A web interface for searching academic papers on OpenAlex by keyword,
-filtering by scientific fields, and classifying results to separate
-genuine mentions from false positives (author names, reference lists).
+A web interface for:
+  1. Searching academic papers on OpenAlex by keyword (company/instrument name)
+  2. Looking up metadata for a list of paper titles uploaded as CSV
 
 Usage:
     pip install streamlit requests pandas
@@ -19,6 +19,7 @@ import time
 import re
 import io
 from datetime import date, timedelta
+from difflib import SequenceMatcher
 
 # ── Page config ────────────────────────────────────────────────────────────────
 
@@ -31,53 +32,34 @@ st.set_page_config(
 BASE_URL = "https://api.openalex.org"
 
 ALL_FIELDS = [
-    "Materials Science",
-    "Chemistry",
-    "Chemical Engineering",
-    "Biochemistry, Genetics and Molecular Biology",
-    "Medicine",
-    "Engineering",
-    "Physics and Astronomy",
+    "Materials Science", "Chemistry", "Chemical Engineering",
+    "Biochemistry, Genetics and Molecular Biology", "Medicine",
+    "Engineering", "Physics and Astronomy",
     "Pharmacology, Toxicology and Pharmaceutics",
     "Agricultural and Biological Sciences",
-    "Immunology and Microbiology",
-    "Neuroscience",
-    "Health Professions",
-    "Multidisciplinary",
-    "Computer Science",
-    "Mathematics",
-    "Environmental Science",
-    "Earth and Planetary Sciences",
-    "Social Sciences",
-    "Arts and Humanities",
-    "Psychology",
+    "Immunology and Microbiology", "Neuroscience", "Health Professions",
+    "Multidisciplinary", "Computer Science", "Mathematics",
+    "Environmental Science", "Earth and Planetary Sciences",
+    "Social Sciences", "Arts and Humanities", "Psychology",
     "Economics, Econometrics and Finance",
-    "Business, Management and Accounting",
-    "Decision Sciences",
-    "Energy",
-    "Nursing",
-    "Veterinary",
-    "Dentistry",
+    "Business, Management and Accounting", "Decision Sciences",
+    "Energy", "Nursing", "Veterinary", "Dentistry",
 ]
 
 DEFAULT_FIELDS = [
-    "Materials Science",
-    "Chemistry",
-    "Chemical Engineering",
-    "Biochemistry, Genetics and Molecular Biology",
-    "Medicine",
-    "Engineering",
-    "Physics and Astronomy",
+    "Materials Science", "Chemistry", "Chemical Engineering",
+    "Biochemistry, Genetics and Molecular Biology", "Medicine",
+    "Engineering", "Physics and Astronomy",
     "Pharmacology, Toxicology and Pharmaceutics",
     "Agricultural and Biological Sciences",
-    "Immunology and Microbiology",
-    "Neuroscience",
-    "Health Professions",
+    "Immunology and Microbiology", "Neuroscience", "Health Professions",
     "Multidisciplinary",
 ]
 
 
-# ── Helpers (from original script) ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def openalex_get(endpoint, params=None, polite_email=""):
     headers = {"User-Agent": f"PaperTracker/1.0 (mailto:{polite_email})"}
@@ -107,6 +89,13 @@ def reconstruct_abstract(inverted_index: dict) -> str:
 
 def normalize_name(name: str) -> str:
     return re.sub(r'\s+', ' ', name.lower().replace('.', ' ')).strip()
+
+
+def title_similarity(a: str, b: str) -> float:
+    """Normalized similarity between two titles (0–100)."""
+    a_clean = re.sub(r'[^\w\s]', '', a.lower()).strip()
+    b_clean = re.sub(r'[^\w\s]', '', b.lower()).strip()
+    return round(SequenceMatcher(None, a_clean, b_clean).ratio() * 100, 1)
 
 
 def matches_excluded_author(author_name: str, excluded_authors: list) -> bool:
@@ -180,7 +169,56 @@ def check_referenced_authors(work, search_term, polite_email):
     }
 
 
-# ── Core pipeline ──────────────────────────────────────────────────────────────
+def extract_work_metadata(work: dict) -> dict:
+    """Extract a flat metadata dict from an OpenAlex work object."""
+    title = work.get("display_name", "") or ""
+
+    authors = []
+    author_institutions = []
+    for authorship in work.get("authorships", []):
+        author = authorship.get("author", {})
+        name = author.get("display_name", "")
+        authors.append(name)
+        for inst in authorship.get("institutions", []):
+            inst_name = inst.get("display_name", "")
+            if inst_name:
+                author_institutions.append(inst_name)
+
+    abstract_idx = work.get("abstract_inverted_index")
+    abstract_text = reconstruct_abstract(abstract_idx) if abstract_idx else ""
+
+    topics = work.get("topics", [])
+    primary_topic = topics[0] if topics else {}
+    topic_name = primary_topic.get("display_name", "")
+    subfield = primary_topic.get("subfield", {}).get("display_name", "")
+    field = primary_topic.get("field", {}).get("display_name", "")
+
+    primary_loc = work.get("primary_location", {}) or {}
+    source = primary_loc.get("source", {}) or {}
+    journal = source.get("display_name", "")
+    oa = work.get("open_access", {}) or {}
+
+    return {
+        "openalex_id": work.get("id", ""),
+        "doi": work.get("doi", ""),
+        "title": title,
+        "abstract": abstract_text[:300] + ("…" if len(abstract_text) > 300 else ""),
+        "publication_date": work.get("publication_date", ""),
+        "authors": "; ".join(authors),
+        "institutions": "; ".join(sorted(set(author_institutions))),
+        "journal": journal,
+        "field": field,
+        "subfield": subfield,
+        "topic": topic_name,
+        "cited_by_count": work.get("cited_by_count", 0),
+        "has_fulltext": work.get("has_fulltext", False),
+        "is_oa": oa.get("is_oa", False),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  KEYWORD SEARCH pipeline
+# ══════════════════════════════════════════════════════════════════════════════
 
 def discover_field_ids(polite_email):
     data = openalex_get("fields", {"per_page": 50}, polite_email)
@@ -358,293 +396,513 @@ def parse_results(works, search_term, excluded_authors, excluded_terms,
     return df, signal_classes
 
 
-# ── Streamlit UI ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  TITLE LOOKUP pipeline
+# ══════════════════════════════════════════════════════════════════════════════
 
-st.title("📚 OpenAlex Paper Tracker")
-st.caption(
-    "Search for academic papers mentioning a keyword (company name, instrument, "
-    "technique) and filter out false positives from author names and reference lists."
+TITLE_SELECT_FIELDS = (
+    "id,doi,display_name,publication_date,authorships,"
+    "primary_location,topics,cited_by_count,has_fulltext,"
+    "open_access,abstract_inverted_index"
 )
 
-# ── Sidebar: all configuration ─────────────────────────────────────────────────
 
-with st.sidebar:
-    st.header("Search parameters")
-
-    search_term = st.text_input(
-        "Search term",
-        value="Pavone",
-        help="Company name, instrument name, or keyword to search for.",
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        date_from = st.date_input(
-            "From date",
-            value=date(2025, 1, 1),
-            min_value=date(2000, 1, 1),
-            max_value=date.today(),
-        )
-    with col2:
-        date_to = st.date_input(
-            "To date",
-            value=date.today(),
-            min_value=date(2000, 1, 1),
-            max_value=date.today(),
-        )
-
-    polite_email = st.text_input(
-        "Email (for OpenAlex polite pool)",
-        value="",
-        help="Optional. Providing an email gives you faster rate limits.",
-    )
-
-    st.markdown("---")
-    st.header("Filters")
-
-    target_fields = st.multiselect(
-        "Scientific fields",
-        options=ALL_FIELDS,
-        default=DEFAULT_FIELDS,
-        help="Only papers in these fields will be returned.",
-    )
-
-    excluded_terms_text = st.text_area(
-        "Excluded terms (one per line)",
-        value="",
-        help=(
-            "Papers containing any of these terms in their title or abstract "
-            "will be classified as EXCLUDED_TERM. Case-insensitive."
-        ),
-    )
-    excluded_terms = [
-        t.strip() for t in excluded_terms_text.strip().splitlines() if t.strip()
-    ]
-
-    excluded_authors_text = st.text_area(
-        "Excluded authors (one per line)",
-        value="",
-        help=(
-            'Authors whose surname matches the search term but are not relevant. '
-            'Use initials or full names, e.g. "S. Pavone" or "Francesco Pavone".'
-        ),
-    )
-    excluded_authors = [
-        a.strip() for a in excluded_authors_text.strip().splitlines() if a.strip()
-    ]
-
-    check_refs = st.checkbox(
-        "Check reference lists",
-        value=True,
-        help=(
-            "For fulltext-only hits, check if the keyword appears only in cited "
-            "references. Slower but reduces false positives."
-        ),
-    )
-
-    st.markdown("---")
-    run_search = st.button("🔍 Run search", type="primary", use_container_width=True)
-
-
-# ── Main area: results ─────────────────────────────────────────────────────────
-
-if run_search:
-    if not search_term:
-        st.error("Please enter a search term.")
-        st.stop()
-    if not target_fields:
-        st.error("Please select at least one scientific field.")
-        st.stop()
-    if date_from > date_to:
-        st.error("'From date' must be ≤ 'To date'.")
-        st.stop()
-
-    # Step 1: Discover fields
-    with st.status("Discovering OpenAlex field IDs…", expanded=False):
-        all_field_map = discover_field_ids(polite_email)
-        field_filter = {
-            name: fid for name, fid in all_field_map.items()
-            if name in target_fields
+def lookup_single_title(query_title: str, polite_email: str) -> dict:
+    """
+    Search OpenAlex for a single title using title.search filter.
+    Returns the best match with similarity score, or a NOT_FOUND row.
+    """
+    try:
+        data = openalex_get("works", {
+            "filter": f'title.search:"{query_title}"',
+            "select": TITLE_SELECT_FIELDS,
+            "per_page": 5,
+        }, polite_email)
+    except Exception as e:
+        return {
+            "query_title": query_title,
+            "match_status": f"API_ERROR ({e})",
+            "similarity": 0.0,
         }
-        st.write(f"Matched {len(field_filter)} of {len(target_fields)} fields.")
 
-    if not field_filter:
-        st.error("No OpenAlex fields matched your selection.")
-        st.stop()
+    results = data.get("results", [])
+    if not results:
+        return {
+            "query_title": query_title,
+            "match_status": "NOT_FOUND",
+            "similarity": 0.0,
+        }
 
-    # Step 2: Search
-    search_progress = st.progress(0, text="Searching OpenAlex…")
+    # Score each candidate and pick the best
+    best_work = None
+    best_sim = -1.0
+    for work in results:
+        returned_title = work.get("display_name", "") or ""
+        sim = title_similarity(query_title, returned_title)
+        if sim > best_sim:
+            best_sim = sim
+            best_work = work
 
-    def update_search_progress(current, total):
-        pct = current / max(total, 1)
-        search_progress.progress(pct, text=f"Fetched {current} of {total} papers…")
-
-    works, total_count = search_works(
-        search_term, date_from.isoformat(), date_to.isoformat(),
-        field_filter, polite_email,
-        progress_callback=update_search_progress,
-    )
-    search_progress.progress(1.0, text=f"Done — {total_count} papers found.")
-
-    if not works:
-        st.warning("No papers found for this query.")
-        st.stop()
-
-    # Step 3: Parse & classify
-    classify_status = st.status(
-        f"Classifying {len(works)} papers…", expanded=False,
-    )
-
-    def update_classify_progress(current, total):
-        classify_status.update(
-            label=f"Classifying… {current}/{total}",
-        )
-
-    df, signal_classes = parse_results(
-        works, search_term, excluded_authors, excluded_terms, check_refs,
-        polite_email,
-        progress_callback=update_classify_progress,
-    )
-    classify_status.update(label="Classification complete ✓", state="complete")
-
-    # Store in session state so it survives re-renders
-    st.session_state["results_df"] = df
-    st.session_state["signal_classes"] = signal_classes
+    meta = extract_work_metadata(best_work)
+    meta["query_title"] = query_title
+    meta["similarity"] = best_sim
+    meta["match_status"] = ""  # will be set after threshold check
+    return meta
 
 
-# ── Display results (persisted in session state) ──────────────────────────────
+def lookup_titles(titles: list, polite_email: str,
+                  sim_threshold: float = 75,
+                  progress_callback=None) -> pd.DataFrame:
+    """Look up a list of titles on OpenAlex. Returns a DataFrame."""
+    rows = []
+    for i, title in enumerate(titles):
+        title = str(title).strip()
+        if not title:
+            continue
 
-if "results_df" in st.session_state:
-    df = st.session_state["results_df"]
-    signal_classes = st.session_state["signal_classes"]
+        row = lookup_single_title(title, polite_email)
 
-    signal_df = df[df["classification"].isin(signal_classes)].copy()
-    noise_df = df[~df["classification"].isin(signal_classes)].copy()
-
-    # ── Summary metrics ───────────────────────────────────────────────────
-    st.markdown("---")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total papers", len(df))
-    m2.metric("Potential matches", len(signal_df))
-    m3.metric("Filtered out", len(noise_df))
-    snr = len(signal_df) / max(len(noise_df), 1)
-    m4.metric("Signal / noise", f"{snr:.2f}")
-
-    # ── Classification breakdown ──────────────────────────────────────────
-    with st.expander("Classification breakdown", expanded=True):
-        class_counts = df["classification"].value_counts().reset_index()
-        class_counts.columns = ["Classification", "Count"]
-        st.bar_chart(class_counts, x="Classification", y="Count")
-
-    # ── Helper: editable table with "Include" checkbox ────────────────────
-    display_cols = [
-        "title", "authors", "publication_date", "journal", "field",
-        "found_in", "classification", "doi",
-    ]
-
-    def show_editable_table(source_df, key_prefix):
-        """Show a data_editor with an Include checkbox. Returns the edited df."""
-        if source_df.empty:
-            st.info("No papers in this category.")
-            return source_df
-
-        edit_df = source_df.reset_index(drop=True).copy()
-        edit_df.insert(0, "Include", True)
-
-        edited = st.data_editor(
-            edit_df[["Include"] + display_cols],
-            use_container_width=True,
-            hide_index=True,
-            key=f"{key_prefix}_editor",
-            column_config={
-                "Include": st.column_config.CheckboxColumn(
-                    "Include",
-                    help="Uncheck to exclude from CSV download",
-                    default=True,
-                ),
-                "doi": st.column_config.LinkColumn("DOI"),
-            },
-            disabled=display_cols,  # only Include is editable
-        )
-        return edited
-
-    # ── Tabs: Signal / All / Noise ────────────────────────────────────────
-    tab_signal, tab_all, tab_noise = st.tabs([
-        f"✅ Potential matches ({len(signal_df)})",
-        f"📋 All results ({len(df)})",
-        f"🚫 Filtered out ({len(noise_df)})",
-    ])
-
-    with tab_signal:
-        edited_signal = show_editable_table(signal_df, "signal")
-
-    with tab_all:
-        edited_all = show_editable_table(df, "all")
-
-    with tab_noise:
-        extra_cols = display_cols + ["matching_authors", "cited_match_authors"]
-        if noise_df.empty:
-            st.info("Nothing was filtered out.")
-            edited_noise = noise_df
+        # Classify based on threshold
+        if row["match_status"] == "NOT_FOUND" or row["match_status"].startswith("API_ERROR"):
+            pass  # keep as-is
+        elif row["similarity"] >= sim_threshold:
+            row["match_status"] = "MATCHED"
         else:
-            edit_noise = noise_df.reset_index(drop=True).copy()
-            edit_noise.insert(0, "Include", True)
-            edited_noise = st.data_editor(
-                edit_noise[["Include"] + extra_cols],
-                use_container_width=True,
-                hide_index=True,
-                key="noise_editor",
-                column_config={
-                    "Include": st.column_config.CheckboxColumn(
-                        "Include",
-                        help="Uncheck to exclude from CSV download",
-                        default=True,
-                    ),
-                    "doi": st.column_config.LinkColumn("DOI"),
-                },
-                disabled=extra_cols,
+            row["match_status"] = "LOW_CONFIDENCE"
+
+        rows.append(row)
+        time.sleep(0.15)
+
+        if progress_callback:
+            progress_callback(i + 1, len(titles))
+
+    return pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SHARED UI COMPONENTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def show_editable_table(source_df, display_cols, key_prefix):
+    """Show a data_editor with an Include checkbox. Returns the edited df."""
+    if source_df.empty:
+        st.info("No papers in this category.")
+        return source_df
+
+    edit_df = source_df.reset_index(drop=True).copy()
+    edit_df.insert(0, "Include", True)
+
+    col_config = {
+        "Include": st.column_config.CheckboxColumn(
+            "Include",
+            help="Uncheck to exclude from CSV download",
+            default=True,
+        ),
+    }
+    if "doi" in display_cols:
+        col_config["doi"] = st.column_config.LinkColumn("DOI")
+    if "similarity" in display_cols:
+        col_config["similarity"] = st.column_config.ProgressColumn(
+            "Similarity %",
+            min_value=0,
+            max_value=100,
+            format="%.1f%%",
+        )
+
+    edited = st.data_editor(
+        edit_df[["Include"] + display_cols],
+        use_container_width=True,
+        hide_index=True,
+        key=f"{key_prefix}_editor",
+        column_config=col_config,
+        disabled=display_cols,
+    )
+    return edited
+
+
+def get_included_csv(edited_df, full_df):
+    """Return CSV bytes for rows where Include is True, with all columns."""
+    if edited_df.empty or "Include" not in edited_df.columns:
+        return full_df.to_csv(index=False).encode("utf-8"), len(full_df)
+    mask = edited_df["Include"].values
+    included = full_df.reset_index(drop=True).loc[mask]
+    return included.to_csv(index=False).encode("utf-8"), len(included)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN UI
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.title("📚 OpenAlex Paper Tracker")
+
+mode_keyword, mode_lookup = st.tabs([
+    "🔍 Keyword Search",
+    "📄 Title Lookup",
+])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  TAB 1: KEYWORD SEARCH
+# ──────────────────────────────────────────────────────────────────────────────
+
+with mode_keyword:
+    st.caption(
+        "Search for academic papers mentioning a keyword (company name, instrument, "
+        "technique) and filter out false positives from author names and reference lists."
+    )
+
+    with st.expander("⚙️ Search configuration", expanded=True):
+        kw_col1, kw_col2 = st.columns([2, 1])
+        with kw_col1:
+            search_term = st.text_input(
+                "Search term",
+                value="Pavone",
+                help="Company name, instrument name, or keyword to search for.",
+            )
+        with kw_col2:
+            polite_email = st.text_input(
+                "Email (OpenAlex polite pool)",
+                value="",
+                help="Optional. Faster rate limits.",
+                key="kw_email",
             )
 
-    # ── Downloads (only checked rows) ─────────────────────────────────────
-    st.markdown("---")
-    st.subheader("Download results")
-    st.caption("Only rows with **Include** checked will be in the CSV.")
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            date_from = st.date_input(
+                "From date", value=date(2025, 1, 1),
+                min_value=date(2000, 1, 1), max_value=date.today(),
+            )
+        with dc2:
+            date_to = st.date_input(
+                "To date", value=date.today(),
+                min_value=date(2000, 1, 1), max_value=date.today(),
+            )
 
-    def get_included_csv(edited_df, full_df):
-        """Return CSV bytes for rows where Include is True, with all columns."""
-        if edited_df.empty or "Include" not in edited_df.columns:
-            return full_df.to_csv(index=False).encode("utf-8"), len(full_df)
-        mask = edited_df["Include"].values
-        included = full_df.reset_index(drop=True).loc[mask]
-        return included.to_csv(index=False).encode("utf-8"), len(included)
-
-    dl1, dl2, dl3 = st.columns(3)
-
-    with dl1:
-        csv_all, n_all = get_included_csv(edited_all, df)
-        st.download_button(
-            f"⬇ All results ({n_all} rows)",
-            csv_all,
-            file_name="openalex_all_results.csv",
-            mime="text/csv",
-        )
-    with dl2:
-        csv_signal, n_signal = get_included_csv(edited_signal, signal_df)
-        st.download_button(
-            f"⬇ Potential matches ({n_signal} rows)",
-            csv_signal,
-            file_name="openalex_potential_matches.csv",
-            mime="text/csv",
-        )
-    with dl3:
-        csv_noise, n_noise = get_included_csv(edited_noise, noise_df)
-        st.download_button(
-            f"⬇ Filtered out ({n_noise} rows)",
-            csv_noise,
-            file_name="openalex_filtered_out.csv",
-            mime="text/csv",
+        target_fields = st.multiselect(
+            "Scientific fields", options=ALL_FIELDS, default=DEFAULT_FIELDS,
+            help="Only papers in these fields will be returned.",
         )
 
-else:
-    # Landing state
-    st.info("👈 Configure your search in the sidebar and click **Run search**.")
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            excluded_terms_text = st.text_area(
+                "Excluded terms (one per line)", value="",
+                help="Papers containing these terms in title/abstract are filtered out.",
+            )
+            excluded_terms = [
+                t.strip() for t in excluded_terms_text.strip().splitlines() if t.strip()
+            ]
+        with fc2:
+            excluded_authors_text = st.text_area(
+                "Excluded authors (one per line)", value="",
+                help='e.g. "S. Pavone" or "Francesco Pavone".',
+            )
+            excluded_authors = [
+                a.strip() for a in excluded_authors_text.strip().splitlines() if a.strip()
+            ]
+
+        check_refs = st.checkbox(
+            "Check reference lists (slower, fewer false positives)", value=True,
+        )
+
+    run_search = st.button("🔍 Run keyword search", type="primary")
+
+    # ── Execute keyword search ────────────────────────────────────────────
+    if run_search:
+        if not search_term:
+            st.error("Please enter a search term.")
+            st.stop()
+        if not target_fields:
+            st.error("Please select at least one scientific field.")
+            st.stop()
+        if date_from > date_to:
+            st.error("'From date' must be ≤ 'To date'.")
+            st.stop()
+
+        with st.status("Discovering OpenAlex field IDs…", expanded=False):
+            all_field_map = discover_field_ids(polite_email)
+            field_filter = {
+                name: fid for name, fid in all_field_map.items()
+                if name in target_fields
+            }
+            st.write(f"Matched {len(field_filter)} of {len(target_fields)} fields.")
+
+        if not field_filter:
+            st.error("No OpenAlex fields matched your selection.")
+            st.stop()
+
+        search_progress = st.progress(0, text="Searching OpenAlex…")
+
+        def update_search_progress(current, total):
+            pct = current / max(total, 1)
+            search_progress.progress(pct, text=f"Fetched {current} of {total} papers…")
+
+        works, total_count = search_works(
+            search_term, date_from.isoformat(), date_to.isoformat(),
+            field_filter, polite_email,
+            progress_callback=update_search_progress,
+        )
+        search_progress.progress(1.0, text=f"Done — {total_count} papers found.")
+
+        if not works:
+            st.warning("No papers found for this query.")
+            st.stop()
+
+        classify_status = st.status(
+            f"Classifying {len(works)} papers…", expanded=False)
+
+        def update_classify_progress(current, total):
+            classify_status.update(label=f"Classifying… {current}/{total}")
+
+        df_kw, signal_classes = parse_results(
+            works, search_term, excluded_authors, excluded_terms, check_refs,
+            polite_email, progress_callback=update_classify_progress,
+        )
+        classify_status.update(label="Classification complete ✓", state="complete")
+
+        st.session_state["kw_results_df"] = df_kw
+        st.session_state["kw_signal_classes"] = signal_classes
+
+    # ── Display keyword search results ────────────────────────────────────
+    if "kw_results_df" in st.session_state:
+        df = st.session_state["kw_results_df"]
+        signal_classes = st.session_state["kw_signal_classes"]
+
+        signal_df = df[df["classification"].isin(signal_classes)].copy()
+        noise_df = df[~df["classification"].isin(signal_classes)].copy()
+
+        st.markdown("---")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total papers", len(df))
+        m2.metric("Potential matches", len(signal_df))
+        m3.metric("Filtered out", len(noise_df))
+        snr = len(signal_df) / max(len(noise_df), 1)
+        m4.metric("Signal / noise", f"{snr:.2f}")
+
+        with st.expander("Classification breakdown", expanded=True):
+            class_counts = df["classification"].value_counts().reset_index()
+            class_counts.columns = ["Classification", "Count"]
+            st.bar_chart(class_counts, x="Classification", y="Count")
+
+        kw_display_cols = [
+            "title", "authors", "publication_date", "journal", "field",
+            "found_in", "classification", "doi",
+        ]
+
+        tab_signal, tab_all, tab_noise = st.tabs([
+            f"✅ Potential matches ({len(signal_df)})",
+            f"📋 All results ({len(df)})",
+            f"🚫 Filtered out ({len(noise_df)})",
+        ])
+
+        with tab_signal:
+            edited_signal = show_editable_table(signal_df, kw_display_cols, "kw_signal")
+        with tab_all:
+            edited_all = show_editable_table(df, kw_display_cols, "kw_all")
+        with tab_noise:
+            extra_cols = kw_display_cols + ["matching_authors", "cited_match_authors"]
+            if noise_df.empty:
+                st.info("Nothing was filtered out.")
+                edited_noise = noise_df
+            else:
+                edited_noise = show_editable_table(noise_df, extra_cols, "kw_noise")
+
+        st.markdown("---")
+        st.subheader("Download results")
+        st.caption("Only rows with **Include** checked will be in the CSV.")
+
+        dl1, dl2, dl3 = st.columns(3)
+        with dl1:
+            csv_all, n_all = get_included_csv(edited_all, df)
+            st.download_button(
+                f"⬇ All results ({n_all} rows)", csv_all,
+                file_name="openalex_all_results.csv", mime="text/csv",
+            )
+        with dl2:
+            csv_signal, n_signal = get_included_csv(edited_signal, signal_df)
+            st.download_button(
+                f"⬇ Potential matches ({n_signal} rows)", csv_signal,
+                file_name="openalex_potential_matches.csv", mime="text/csv",
+            )
+        with dl3:
+            csv_noise, n_noise = get_included_csv(edited_noise, noise_df)
+            st.download_button(
+                f"⬇ Filtered out ({n_noise} rows)", csv_noise,
+                file_name="openalex_filtered_out.csv", mime="text/csv",
+            )
+    else:
+        st.info("Configure your search above and click **Run keyword search**.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  TAB 2: TITLE LOOKUP
+# ──────────────────────────────────────────────────────────────────────────────
+
+with mode_lookup:
+    st.caption(
+        "Upload a CSV with paper titles. The app searches OpenAlex for each title, "
+        "retrieves full metadata, and lets you download the enriched results."
+    )
+
+    with st.expander("⚙️ Lookup configuration", expanded=True):
+        lu_col1, lu_col2 = st.columns(2)
+        with lu_col1:
+            uploaded_file = st.file_uploader(
+                "Upload CSV with titles", type=["csv"],
+                help="The CSV must have a column containing paper titles.",
+            )
+        with lu_col2:
+            lu_email = st.text_input(
+                "Email (OpenAlex polite pool)", value="",
+                help="Optional. Faster rate limits.", key="lu_email",
+            )
+
+        lc1, lc2 = st.columns(2)
+        with lc1:
+            title_column = st.text_input(
+                "Title column name", value="title",
+                help="Column in your CSV that contains paper titles. "
+                     "Case-sensitive. If blank, the first column is used.",
+            )
+        with lc2:
+            sim_threshold = st.slider(
+                "Minimum similarity for confident match (%)",
+                min_value=50, max_value=100, value=75, step=5,
+                help="Matches below this are flagged as LOW_CONFIDENCE.",
+            )
+
+    # ── Preview uploaded CSV ──────────────────────────────────────────────
+    titles_to_lookup = []
+    col_name_used = ""
+
+    if uploaded_file is not None:
+        try:
+            input_df = pd.read_csv(uploaded_file)
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
+            input_df = None
+
+        if input_df is not None:
+            col_name = title_column.strip() if title_column.strip() else None
+
+            if col_name and col_name in input_df.columns:
+                titles_to_lookup = input_df[col_name].dropna().tolist()
+                col_name_used = col_name
+            elif col_name and col_name not in input_df.columns:
+                st.warning(
+                    f'Column "{col_name}" not found. '
+                    f"Available columns: {', '.join(input_df.columns)}"
+                )
+            else:
+                titles_to_lookup = input_df.iloc[:, 0].dropna().tolist()
+                col_name_used = input_df.columns[0]
+
+            if titles_to_lookup:
+                st.write(
+                    f"Found **{len(titles_to_lookup)}** titles in column "
+                    f"**{col_name_used}**. Preview:"
+                )
+                preview = pd.DataFrame({
+                    "#": range(1, min(len(titles_to_lookup), 10) + 1),
+                    "title": titles_to_lookup[:10],
+                })
+                st.dataframe(preview, use_container_width=True, hide_index=True)
+
+    run_lookup = st.button(
+        "📄 Look up titles", type="primary",
+        disabled=len(titles_to_lookup) == 0,
+    )
+
+    # ── Execute title lookup ──────────────────────────────────────────────
+    if run_lookup and titles_to_lookup:
+        progress = st.progress(0, text="Looking up titles on OpenAlex…")
+
+        def update_lu_progress(current, total):
+            pct = current / max(total, 1)
+            progress.progress(pct, text=f"Looked up {current} of {total} titles…")
+
+        lu_df = lookup_titles(
+            titles_to_lookup, lu_email,
+            sim_threshold=sim_threshold,
+            progress_callback=update_lu_progress,
+        )
+        progress.progress(1.0, text=f"Done — {len(lu_df)} titles processed.")
+
+        st.session_state["lu_results_df"] = lu_df
+
+    # ── Display title lookup results ──────────────────────────────────────
+    if "lu_results_df" in st.session_state:
+        lu_df = st.session_state["lu_results_df"]
+
+        if lu_df.empty:
+            st.warning("No results.")
+        else:
+            matched = lu_df[lu_df["match_status"] == "MATCHED"].copy()
+            low_conf = lu_df[lu_df["match_status"] == "LOW_CONFIDENCE"].copy()
+            not_found = lu_df[
+                (lu_df["match_status"] == "NOT_FOUND")
+                | lu_df["match_status"].str.startswith("API_ERROR")
+            ].copy()
+
+            st.markdown("---")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total titles", len(lu_df))
+            m2.metric("Matched", len(matched))
+            m3.metric("Low confidence", len(low_conf))
+            m4.metric("Not found", len(not_found))
+
+            lu_display_cols = [
+                "query_title", "match_status", "similarity",
+                "title", "authors", "publication_date", "journal",
+                "field", "doi",
+            ]
+            lu_display_cols = [c for c in lu_display_cols if c in lu_df.columns]
+
+            tab_m, tab_lc, tab_nf, tab_la = st.tabs([
+                f"✅ Matched ({len(matched)})",
+                f"⚠️ Low confidence ({len(low_conf)})",
+                f"❌ Not found ({len(not_found)})",
+                f"📋 All ({len(lu_df)})",
+            ])
+
+            with tab_m:
+                edited_matched = show_editable_table(matched, lu_display_cols, "lu_matched")
+            with tab_lc:
+                edited_lowconf = show_editable_table(low_conf, lu_display_cols, "lu_lowconf")
+            with tab_nf:
+                nf_cols = [c for c in ["query_title", "match_status"] if c in lu_df.columns]
+                if not_found.empty:
+                    st.info("All titles were found.")
+                    edited_nf = not_found
+                else:
+                    edited_nf = show_editable_table(not_found, nf_cols, "lu_nf")
+            with tab_la:
+                edited_lu_all = show_editable_table(lu_df, lu_display_cols, "lu_all")
+
+            st.markdown("---")
+            st.subheader("Download results")
+            st.caption("Only rows with **Include** checked will be in the CSV.")
+
+            dl1, dl2, dl3 = st.columns(3)
+            with dl1:
+                csv_la, n = get_included_csv(edited_lu_all, lu_df)
+                st.download_button(
+                    f"⬇ All looked-up ({n} rows)", csv_la,
+                    file_name="openalex_title_lookup_all.csv", mime="text/csv",
+                )
+            with dl2:
+                csv_m, n = get_included_csv(edited_matched, matched)
+                st.download_button(
+                    f"⬇ Matched only ({n} rows)", csv_m,
+                    file_name="openalex_title_lookup_matched.csv", mime="text/csv",
+                )
+            with dl3:
+                csv_lc, n = get_included_csv(edited_lowconf, low_conf)
+                st.download_button(
+                    f"⬇ Low confidence ({n} rows)", csv_lc,
+                    file_name="openalex_title_lookup_low_confidence.csv", mime="text/csv",
+                )
+
+    elif uploaded_file is None:
+        st.info("Upload a CSV with paper titles to get started.")
