@@ -450,13 +450,21 @@ def lookup_single_title(query_title: str, polite_email: str) -> dict:
     return meta
 
 
-def lookup_titles(titles: list, polite_email: str,
-                  sim_threshold: float = 75,
+def lookup_titles(input_df: pd.DataFrame, title_col: str,
+                  polite_email: str, sim_threshold: float = 75,
                   progress_callback=None) -> pd.DataFrame:
-    """Look up a list of titles on OpenAlex. Returns a DataFrame."""
+    """
+    Look up each title in input_df on OpenAlex.
+    Returns a DataFrame with all original columns plus OpenAlex metadata.
+    """
     rows = []
-    for i, title in enumerate(titles):
-        title = str(title).strip()
+    # Columns from the original CSV (excluding the title column itself,
+    # which will appear as query_title)
+    orig_cols = [c for c in input_df.columns if c != title_col]
+
+    for i, (_, orig_row) in enumerate(input_df.iterrows()):
+        raw_title = orig_row[title_col]
+        title = str(raw_title).strip() if pd.notna(raw_title) else ""
         if not title:
             continue
 
@@ -464,17 +472,23 @@ def lookup_titles(titles: list, polite_email: str,
 
         # Classify based on threshold
         if row["match_status"] == "NOT_FOUND" or row["match_status"].startswith("API_ERROR"):
-            pass  # keep as-is
+            pass
         elif row["similarity"] >= sim_threshold:
             row["match_status"] = "MATCHED"
         else:
             row["match_status"] = "LOW_CONFIDENCE"
 
+        # Carry over all original columns (prefix with "input_" if they
+        # collide with an OpenAlex column)
+        for col in orig_cols:
+            out_col = f"input_{col}" if col in row else col
+            row[out_col] = orig_row[col]
+
         rows.append(row)
         time.sleep(0.15)
 
         if progress_callback:
-            progress_callback(i + 1, len(titles))
+            progress_callback(i + 1, len(input_df))
 
     return pd.DataFrame(rows)
 
@@ -775,6 +789,7 @@ with mode_lookup:
     # ── Preview uploaded CSV ──────────────────────────────────────────────
     titles_to_lookup = []
     col_name_used = ""
+    lookup_input_df = None
 
     if uploaded_file is not None:
         try:
@@ -787,7 +802,6 @@ with mode_lookup:
             col_name = title_column.strip() if title_column.strip() else None
 
             if col_name and col_name in input_df.columns:
-                titles_to_lookup = input_df[col_name].dropna().tolist()
                 col_name_used = col_name
             elif col_name and col_name not in input_df.columns:
                 st.warning(
@@ -795,19 +809,32 @@ with mode_lookup:
                     f"Available columns: {', '.join(input_df.columns)}"
                 )
             else:
-                titles_to_lookup = input_df.iloc[:, 0].dropna().tolist()
                 col_name_used = input_df.columns[0]
 
+            if col_name_used:
+                # Keep only rows where the title column is non-empty
+                lookup_input_df = input_df[input_df[col_name_used].notna()].copy()
+                lookup_input_df = lookup_input_df[
+                    lookup_input_df[col_name_used].astype(str).str.strip() != ""
+                ]
+                titles_to_lookup = lookup_input_df[col_name_used].tolist()
+
             if titles_to_lookup:
+                other_cols = [c for c in input_df.columns if c != col_name_used]
+                extra_info = (
+                    f" + {len(other_cols)} extra column(s): "
+                    f"**{', '.join(other_cols)}**"
+                    if other_cols else ""
+                )
                 st.write(
                     f"Found **{len(titles_to_lookup)}** titles in column "
-                    f"**{col_name_used}**. Preview:"
+                    f"**{col_name_used}**{extra_info}. Preview:"
                 )
-                preview = pd.DataFrame({
-                    "#": range(1, min(len(titles_to_lookup), 10) + 1),
-                    "title": titles_to_lookup[:10],
-                })
-                st.dataframe(preview, use_container_width=True, hide_index=True)
+                st.dataframe(
+                    input_df.head(10),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
     run_lookup = st.button(
         "📄 Look up titles", type="primary",
@@ -815,7 +842,7 @@ with mode_lookup:
     )
 
     # ── Execute title lookup ──────────────────────────────────────────────
-    if run_lookup and titles_to_lookup:
+    if run_lookup and titles_to_lookup and lookup_input_df is not None:
         progress = st.progress(0, text="Looking up titles on OpenAlex…")
 
         def update_lu_progress(current, total):
@@ -823,7 +850,7 @@ with mode_lookup:
             progress.progress(pct, text=f"Looked up {current} of {total} titles…")
 
         lu_df = lookup_titles(
-            titles_to_lookup, lu_email,
+            lookup_input_df, col_name_used, lu_email,
             sim_threshold=sim_threshold,
             progress_callback=update_lu_progress,
         )
@@ -852,12 +879,28 @@ with mode_lookup:
             m3.metric("Low confidence", len(low_conf))
             m4.metric("Not found", len(not_found))
 
-            lu_display_cols = [
+            lu_core_cols = [
                 "query_title", "match_status", "similarity",
                 "title", "authors", "publication_date", "journal",
                 "field", "doi",
             ]
-            lu_display_cols = [c for c in lu_display_cols if c in lu_df.columns]
+            # Detect original CSV columns carried through (anything not from
+            # OpenAlex metadata or the lookup pipeline itself)
+            oa_cols = {
+                "query_title", "match_status", "similarity",
+                "openalex_id", "doi", "title", "abstract",
+                "publication_date", "authors", "institutions", "journal",
+                "field", "subfield", "topic", "cited_by_count",
+                "has_fulltext", "is_oa",
+            }
+            orig_carried_cols = [
+                c for c in lu_df.columns if c not in oa_cols
+            ]
+
+            lu_display_cols = [
+                c for c in lu_core_cols + orig_carried_cols
+                if c in lu_df.columns
+            ]
 
             tab_m, tab_lc, tab_nf, tab_la = st.tabs([
                 f"✅ Matched ({len(matched)})",
@@ -871,7 +914,10 @@ with mode_lookup:
             with tab_lc:
                 edited_lowconf = show_editable_table(low_conf, lu_display_cols, "lu_lowconf")
             with tab_nf:
-                nf_cols = [c for c in ["query_title", "match_status"] if c in lu_df.columns]
+                nf_cols = [
+                    c for c in ["query_title", "match_status"] + orig_carried_cols
+                    if c in lu_df.columns
+                ]
                 if not_found.empty:
                     st.info("All titles were found.")
                     edited_nf = not_found
