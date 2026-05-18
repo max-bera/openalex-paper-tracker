@@ -226,60 +226,37 @@ def extract_work_metadata(work: dict) -> dict:
 
 # Ordered longest-first so "Piuma Chiaro" is matched before "Piuma" or "Chiaro"
 INSTRUMENT_NAMES = ["Piuma Chiaro", "Piuma", "Chiaro", "Pavone", "Cuore"]
-VICINITY_CHARS = 300  # characters each side of the search term to scan
 
 
 def detect_machine(title: str, abstract: str, search_term: str) -> str:
     """
-    Look for known instrument names near the search term in title/abstract.
+    Look for known instrument names anywhere in the title or abstract.
 
     Strategy:
       1. If the search term itself IS an instrument name and appears in
          title or abstract, return it directly.
-      2. Otherwise, find every occurrence of the search term in the combined
-         text, extract a window of ±VICINITY_CHARS around it, and look for
-         instrument names (word-boundary matched) inside that window.
+      2. Otherwise, scan the full title + abstract for instrument names
+         using word-boundary matching.
       3. "Piuma Chiaro" is checked before "Piuma"/"Chiaro" individually so
          the compound product name takes priority.
 
     Returns a semicolon-joined string of detected instruments, or "".
     """
-    text = f"{title}  {abstract}"
-    text_lower = text.lower()
+    text_lower = f"{title}  {abstract}".lower()
     term_lower = search_term.lower()
 
     # Step 1: Is the search term itself an instrument?
     for instr in INSTRUMENT_NAMES:
         if term_lower == instr.lower():
-            # Only count if the term actually appears in text (not just as
-            # an author name picked up by fulltext search)
             if instr.lower() in title.lower() or instr.lower() in abstract.lower():
                 return instr
             return ""
 
-    # Step 2: Find vicinity windows around every occurrence of the search term
-    windows = []
-    start = 0
-    while True:
-        idx = text_lower.find(term_lower, start)
-        if idx == -1:
-            break
-        win_start = max(0, idx - VICINITY_CHARS)
-        win_end = min(len(text), idx + len(term_lower) + VICINITY_CHARS)
-        windows.append(text_lower[win_start:win_end])
-        start = idx + 1
-
-    if not windows:
-        # Search term not in title/abstract at all (fulltext-only hit);
-        # also scan the title on its own as a fallback
-        windows = [title.lower()]
-
-    # Step 3: Scan windows for instrument names (word-boundary match)
+    # Step 2: Scan full text for instrument names (word-boundary match)
     found = []
-    combined = " ".join(windows)
     for instr in INSTRUMENT_NAMES:
         pattern = r'\b' + re.escape(instr.lower()) + r'\b'
-        if re.search(pattern, combined):
+        if re.search(pattern, text_lower):
             # If we matched the compound "Piuma Chiaro", don't also add
             # the individual "Piuma" or "Chiaro"
             if instr in ("Piuma", "Chiaro") and "Piuma Chiaro" in found:
