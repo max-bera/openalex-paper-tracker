@@ -18,6 +18,7 @@ import pandas as pd
 import time
 import re
 import io
+from datetime import date, timedelta
 
 # ── Page config ────────────────────────────────────────────────────────────────
 
@@ -190,14 +191,11 @@ def discover_field_ids(polite_email):
     return mapping
 
 
-def search_works(search_term, year_from, year_to, field_filter, polite_email,
+def search_works(search_term, date_from, date_to, field_filter, polite_email,
                  progress_callback=None):
     field_id_values = "|".join(field_filter.values())
-    if year_from == year_to:
-        year_part = f"publication_year:{year_from}"
-    else:
-        year_part = f"publication_year:{year_from}-{year_to}"
-    combined_filter = f"{year_part},topics.field.id:{field_id_values}"
+    date_part = f"from_publication_date:{date_from},to_publication_date:{date_to}"
+    combined_filter = f"{date_part},topics.field.id:{field_id_values}"
 
     all_results = []
     page = 1
@@ -233,8 +231,8 @@ def search_works(search_term, year_from, year_to, field_filter, polite_email,
     return all_results, total
 
 
-def parse_results(works, search_term, excluded_authors, check_references,
-                  polite_email, progress_callback=None):
+def parse_results(works, search_term, excluded_authors, excluded_terms,
+                  check_references, polite_email, progress_callback=None):
     rows = []
     signal_classes = [
         "TITLE_MATCH", "ABSTRACT_MATCH",
@@ -282,6 +280,15 @@ def parse_results(works, search_term, excluded_authors, check_references,
         if not found_in:
             found_in.append("fulltext_only")
 
+        # Excluded terms check
+        has_excluded_term = False
+        matched_excluded_term = ""
+        for ex_term in excluded_terms:
+            if ex_term.lower() in title.lower() or ex_term.lower() in abstract_text.lower():
+                has_excluded_term = True
+                matched_excluded_term = ex_term
+                break
+
         # Reference check
         cited_match_count = 0
         cited_match_authors = ""
@@ -291,7 +298,9 @@ def parse_results(works, search_term, excluded_authors, check_references,
             cited_match_authors = ref_info["cited_match_authors"]
 
         # Classify
-        if is_excluded_author:
+        if has_excluded_term:
+            classification = f"EXCLUDED_TERM ({matched_excluded_term})"
+        elif is_excluded_author:
             classification = "EXCLUDED_AUTHOR"
         elif term_is_author and not term_in_title and not term_in_abstract:
             classification = "AUTHOR_FALSE_POSITIVE"
@@ -370,9 +379,19 @@ with st.sidebar:
 
     col1, col2 = st.columns(2)
     with col1:
-        year_from = st.number_input("From year", 2000, 2030, 2025)
+        date_from = st.date_input(
+            "From date",
+            value=date(2025, 1, 1),
+            min_value=date(2000, 1, 1),
+            max_value=date.today(),
+        )
     with col2:
-        year_to = st.number_input("To year", 2000, 2030, 2025)
+        date_to = st.date_input(
+            "To date",
+            value=date.today(),
+            min_value=date(2000, 1, 1),
+            max_value=date.today(),
+        )
 
     polite_email = st.text_input(
         "Email (for OpenAlex polite pool)",
@@ -389,6 +408,18 @@ with st.sidebar:
         default=DEFAULT_FIELDS,
         help="Only papers in these fields will be returned.",
     )
+
+    excluded_terms_text = st.text_area(
+        "Excluded terms (one per line)",
+        value="",
+        help=(
+            "Papers containing any of these terms in their title or abstract "
+            "will be classified as EXCLUDED_TERM. Case-insensitive."
+        ),
+    )
+    excluded_terms = [
+        t.strip() for t in excluded_terms_text.strip().splitlines() if t.strip()
+    ]
 
     excluded_authors_text = st.text_area(
         "Excluded authors (one per line)",
@@ -424,8 +455,8 @@ if run_search:
     if not target_fields:
         st.error("Please select at least one scientific field.")
         st.stop()
-    if year_from > year_to:
-        st.error("'From year' must be ≤ 'To year'.")
+    if date_from > date_to:
+        st.error("'From date' must be ≤ 'To date'.")
         st.stop()
 
     # Step 1: Discover fields
@@ -449,7 +480,8 @@ if run_search:
         search_progress.progress(pct, text=f"Fetched {current} of {total} papers…")
 
     works, total_count = search_works(
-        search_term, year_from, year_to, field_filter, polite_email,
+        search_term, date_from.isoformat(), date_to.isoformat(),
+        field_filter, polite_email,
         progress_callback=update_search_progress,
     )
     search_progress.progress(1.0, text=f"Done — {total_count} papers found.")
@@ -469,7 +501,8 @@ if run_search:
         )
 
     df, signal_classes = parse_results(
-        works, search_term, excluded_authors, check_refs, polite_email,
+        works, search_term, excluded_authors, excluded_terms, check_refs,
+        polite_email,
         progress_callback=update_classify_progress,
     )
     classify_status.update(label="Classification complete ✓", state="complete")
@@ -485,8 +518,8 @@ if "results_df" in st.session_state:
     df = st.session_state["results_df"]
     signal_classes = st.session_state["signal_classes"]
 
-    signal_df = df[df["classification"].isin(signal_classes)]
-    noise_df = df[~df["classification"].isin(signal_classes)]
+    signal_df = df[df["classification"].isin(signal_classes)].copy()
+    noise_df = df[~df["classification"].isin(signal_classes)].copy()
 
     # ── Summary metrics ───────────────────────────────────────────────────
     st.markdown("---")
@@ -503,76 +536,110 @@ if "results_df" in st.session_state:
         class_counts.columns = ["Classification", "Count"]
         st.bar_chart(class_counts, x="Classification", y="Count")
 
-    # ── Tabs: Signal vs Noise ─────────────────────────────────────────────
+    # ── Helper: editable table with "Include" checkbox ────────────────────
+    display_cols = [
+        "title", "authors", "publication_date", "journal", "field",
+        "found_in", "classification", "doi",
+    ]
+
+    def show_editable_table(source_df, key_prefix):
+        """Show a data_editor with an Include checkbox. Returns the edited df."""
+        if source_df.empty:
+            st.info("No papers in this category.")
+            return source_df
+
+        edit_df = source_df.reset_index(drop=True).copy()
+        edit_df.insert(0, "Include", True)
+
+        edited = st.data_editor(
+            edit_df[["Include"] + display_cols],
+            use_container_width=True,
+            hide_index=True,
+            key=f"{key_prefix}_editor",
+            column_config={
+                "Include": st.column_config.CheckboxColumn(
+                    "Include",
+                    help="Uncheck to exclude from CSV download",
+                    default=True,
+                ),
+                "doi": st.column_config.LinkColumn("DOI"),
+            },
+            disabled=display_cols,  # only Include is editable
+        )
+        return edited
+
+    # ── Tabs: Signal / All / Noise ────────────────────────────────────────
     tab_signal, tab_all, tab_noise = st.tabs([
         f"✅ Potential matches ({len(signal_df)})",
         f"📋 All results ({len(df)})",
         f"🚫 Filtered out ({len(noise_df)})",
     ])
 
-    display_cols = [
-        "title", "authors", "publication_date", "journal", "field",
-        "found_in", "classification", "doi",
-    ]
-
     with tab_signal:
-        if signal_df.empty:
-            st.info("No potential matches found.")
-        else:
-            st.dataframe(
-                signal_df[display_cols],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "doi": st.column_config.LinkColumn("DOI"),
-                },
-            )
+        edited_signal = show_editable_table(signal_df, "signal")
 
     with tab_all:
-        st.dataframe(
-            df[display_cols],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "doi": st.column_config.LinkColumn("DOI"),
-            },
-        )
+        edited_all = show_editable_table(df, "all")
 
     with tab_noise:
+        extra_cols = display_cols + ["matching_authors", "cited_match_authors"]
         if noise_df.empty:
             st.info("Nothing was filtered out.")
+            edited_noise = noise_df
         else:
-            st.dataframe(
-                noise_df[display_cols + ["matching_authors", "cited_match_authors"]],
+            edit_noise = noise_df.reset_index(drop=True).copy()
+            edit_noise.insert(0, "Include", True)
+            edited_noise = st.data_editor(
+                edit_noise[["Include"] + extra_cols],
                 use_container_width=True,
                 hide_index=True,
+                key="noise_editor",
+                column_config={
+                    "Include": st.column_config.CheckboxColumn(
+                        "Include",
+                        help="Uncheck to exclude from CSV download",
+                        default=True,
+                    ),
+                    "doi": st.column_config.LinkColumn("DOI"),
+                },
+                disabled=extra_cols,
             )
 
-    # ── Downloads ─────────────────────────────────────────────────────────
+    # ── Downloads (only checked rows) ─────────────────────────────────────
     st.markdown("---")
     st.subheader("Download results")
+    st.caption("Only rows with **Include** checked will be in the CSV.")
+
+    def get_included_csv(edited_df, full_df):
+        """Return CSV bytes for rows where Include is True, with all columns."""
+        if edited_df.empty or "Include" not in edited_df.columns:
+            return full_df.to_csv(index=False).encode("utf-8"), len(full_df)
+        mask = edited_df["Include"].values
+        included = full_df.reset_index(drop=True).loc[mask]
+        return included.to_csv(index=False).encode("utf-8"), len(included)
+
     dl1, dl2, dl3 = st.columns(3)
 
     with dl1:
-        csv_all = df.to_csv(index=False).encode("utf-8")
+        csv_all, n_all = get_included_csv(edited_all, df)
         st.download_button(
-            "⬇ All results (CSV)",
+            f"⬇ All results ({n_all} rows)",
             csv_all,
             file_name="openalex_all_results.csv",
             mime="text/csv",
         )
     with dl2:
-        csv_signal = signal_df.to_csv(index=False).encode("utf-8")
+        csv_signal, n_signal = get_included_csv(edited_signal, signal_df)
         st.download_button(
-            "⬇ Potential matches (CSV)",
+            f"⬇ Potential matches ({n_signal} rows)",
             csv_signal,
             file_name="openalex_potential_matches.csv",
             mime="text/csv",
         )
     with dl3:
-        csv_noise = noise_df.to_csv(index=False).encode("utf-8")
+        csv_noise, n_noise = get_included_csv(edited_noise, noise_df)
         st.download_button(
-            "⬇ Filtered out (CSV)",
+            f"⬇ Filtered out ({n_noise} rows)",
             csv_noise,
             file_name="openalex_filtered_out.csv",
             mime="text/csv",
