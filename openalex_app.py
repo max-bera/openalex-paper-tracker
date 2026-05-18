@@ -570,7 +570,7 @@ with mode_keyword:
         with kw_col1:
             search_term = st.text_input(
                 "Search term",
-                value="Pavone",
+                value="Optics11",
                 help="Company name, instrument name, or keyword to search for.",
             )
         with kw_col2:
@@ -584,7 +584,7 @@ with mode_keyword:
         dc1, dc2 = st.columns(2)
         with dc1:
             date_from = st.date_input(
-                "From date", value=date(2025, 1, 1),
+                "From date", value=date(2026, 1, 1),
                 min_value=date(2000, 1, 1), max_value=date.today(),
             )
         with dc2:
@@ -601,7 +601,7 @@ with mode_keyword:
         fc1, fc2 = st.columns(2)
         with fc1:
             excluded_terms_text = st.text_area(
-                "Excluded terms (one per line)", value="",
+                "Excluded terms (one per line)", value="partial discharge \n FBG",
                 help="Papers containing these terms in title/abstract are filtered out.",
             )
             excluded_terms = [
@@ -775,7 +775,7 @@ with mode_lookup:
         lc1, lc2 = st.columns(2)
         with lc1:
             title_column = st.text_input(
-                "Title column name", value="title",
+                "Title column name", value="Title",
                 help="Column in your CSV that contains paper titles. "
                      "Case-sensitive. If blank, the first column is used.",
             )
