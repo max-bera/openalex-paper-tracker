@@ -193,22 +193,6 @@ def extract_work_metadata(work: dict) -> dict:
     abstract_idx = work.get("abstract_inverted_index")
     abstract_text = reconstruct_abstract(abstract_idx) if abstract_idx else ""
 
-    # Keywords
-    keywords_list = work.get("keywords", []) or []
-    keywords = "; ".join(kw.get("keyword", "") for kw in keywords_list if kw.get("keyword"))
-
-    # Funding / grants
-    grants_list = work.get("grants", []) or []
-    funding_parts = []
-    for grant in grants_list:
-        funder = grant.get("funder_display_name", "") or ""
-        award_id = grant.get("award_id", "") or ""
-        if funder and award_id:
-            funding_parts.append(f"{funder} ({award_id})")
-        elif funder:
-            funding_parts.append(funder)
-    funding = "; ".join(sorted(set(funding_parts)))
-
     topics = work.get("topics", [])
     primary_topic = topics[0] if topics else {}
     topic_name = primary_topic.get("display_name", "")
@@ -232,12 +216,77 @@ def extract_work_metadata(work: dict) -> dict:
         "field": field,
         "subfield": subfield,
         "topic": topic_name,
-        "keywords": keywords,
-        "funding": funding,
         "cited_by_count": work.get("cited_by_count", 0),
         "has_fulltext": work.get("has_fulltext", False),
         "is_oa": oa.get("is_oa", False),
     }
+
+
+# ── Machine (instrument) detection ─────────────────────────────────────────────
+
+# Ordered longest-first so "Piuma Chiaro" is matched before "Piuma" or "Chiaro"
+INSTRUMENT_NAMES = ["Piuma Chiaro", "Piuma", "Chiaro", "Pavone", "Cuore"]
+VICINITY_CHARS = 300  # characters each side of the search term to scan
+
+
+def detect_machine(title: str, abstract: str, search_term: str) -> str:
+    """
+    Look for known instrument names near the search term in title/abstract.
+
+    Strategy:
+      1. If the search term itself IS an instrument name and appears in
+         title or abstract, return it directly.
+      2. Otherwise, find every occurrence of the search term in the combined
+         text, extract a window of ±VICINITY_CHARS around it, and look for
+         instrument names (word-boundary matched) inside that window.
+      3. "Piuma Chiaro" is checked before "Piuma"/"Chiaro" individually so
+         the compound product name takes priority.
+
+    Returns a semicolon-joined string of detected instruments, or "".
+    """
+    text = f"{title}  {abstract}"
+    text_lower = text.lower()
+    term_lower = search_term.lower()
+
+    # Step 1: Is the search term itself an instrument?
+    for instr in INSTRUMENT_NAMES:
+        if term_lower == instr.lower():
+            # Only count if the term actually appears in text (not just as
+            # an author name picked up by fulltext search)
+            if instr.lower() in title.lower() or instr.lower() in abstract.lower():
+                return instr
+            return ""
+
+    # Step 2: Find vicinity windows around every occurrence of the search term
+    windows = []
+    start = 0
+    while True:
+        idx = text_lower.find(term_lower, start)
+        if idx == -1:
+            break
+        win_start = max(0, idx - VICINITY_CHARS)
+        win_end = min(len(text), idx + len(term_lower) + VICINITY_CHARS)
+        windows.append(text_lower[win_start:win_end])
+        start = idx + 1
+
+    if not windows:
+        # Search term not in title/abstract at all (fulltext-only hit);
+        # also scan the title on its own as a fallback
+        windows = [title.lower()]
+
+    # Step 3: Scan windows for instrument names (word-boundary match)
+    found = []
+    combined = " ".join(windows)
+    for instr in INSTRUMENT_NAMES:
+        pattern = r'\b' + re.escape(instr.lower()) + r'\b'
+        if re.search(pattern, combined):
+            # If we matched the compound "Piuma Chiaro", don't also add
+            # the individual "Piuma" or "Chiaro"
+            if instr in ("Piuma", "Chiaro") and "Piuma Chiaro" in found:
+                continue
+            found.append(instr)
+
+    return "; ".join(found)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -393,23 +442,8 @@ def parse_results(works, search_term, excluded_authors, excluded_terms,
         journal = source.get("display_name", "")
         oa = work.get("open_access", {}) or {}
 
-        # Keywords
-        keywords_list = work.get("keywords", []) or []
-        keywords = "; ".join(
-            kw.get("keyword", "") for kw in keywords_list if kw.get("keyword")
-        )
-
-        # Funding / grants
-        grants_list = work.get("grants", []) or []
-        funding_parts = []
-        for grant in grants_list:
-            funder = grant.get("funder_display_name", "") or ""
-            award_id = grant.get("award_id", "") or ""
-            if funder and award_id:
-                funding_parts.append(f"{funder} ({award_id})")
-            elif funder:
-                funding_parts.append(funder)
-        funding = "; ".join(sorted(set(funding_parts)))
+        # Detect instrument name near the search term
+        machine = detect_machine(title, abstract_text, search_term)
 
         rows.append({
             "openalex_id": work.get("id", ""),
@@ -423,8 +457,7 @@ def parse_results(works, search_term, excluded_authors, excluded_terms,
             "field": field,
             "subfield": subfield,
             "topic": topic_name,
-            "keywords": keywords,
-            "funding": funding,
+            "machine": machine,
             "cited_by_count": work.get("cited_by_count", 0),
             "has_fulltext": work.get("has_fulltext", False),
             "is_oa": oa.get("is_oa", False),
@@ -741,8 +774,7 @@ with mode_keyword:
 
         kw_display_cols = [
             "title", "authors", "publication_date", "journal", "field",
-            "keywords", "funding",
-            "found_in", "classification", "doi",
+            "machine", "found_in", "classification", "doi",
         ]
 
         tab_signal, tab_all, tab_noise = st.tabs([
@@ -923,7 +955,7 @@ with mode_lookup:
             lu_core_cols = [
                 "query_title", "match_status", "similarity",
                 "title", "authors", "publication_date", "journal",
-                "field", "keywords", "funding", "doi",
+                "field", "doi",
             ]
             # Detect original CSV columns carried through (anything not from
             # OpenAlex metadata or the lookup pipeline itself)
@@ -931,7 +963,7 @@ with mode_lookup:
                 "query_title", "match_status", "similarity",
                 "openalex_id", "doi", "title", "abstract",
                 "publication_date", "authors", "institutions", "journal",
-                "field", "subfield", "topic", "keywords", "funding",
+                "field", "subfield", "topic", "cited_by_count",
                 "cited_by_count", "has_fulltext", "is_oa",
             }
             orig_carried_cols = [
