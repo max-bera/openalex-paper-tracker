@@ -61,19 +61,78 @@ DEFAULT_FIELDS = [
 #  HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def get_api_key():
+    """
+    Resolve the OpenAlex API key.
+
+    Priority:
+      1. Sidebar text input (st.session_state['openalex_api_key'])
+      2. Streamlit secrets (OPENALEX_API_KEY in .streamlit/secrets.toml)
+
+    OpenAlex made API keys mandatory on 2026-02-13 and removed the old
+    email "polite pool", so a key is now required for every request.
+    Free keys: https://openalex.org/settings/api
+    """
+    key = (st.session_state.get("openalex_api_key") or "").strip()
+    if key:
+        return key
+    try:
+        return (st.secrets.get("OPENALEX_API_KEY", "") or "").strip()
+    except Exception:
+        # No secrets.toml present
+        return ""
+
+
 def openalex_get(endpoint, params=None, polite_email=""):
-    headers = {"User-Agent": f"PaperTracker/1.0 (mailto:{polite_email})"}
+    # `polite_email` is retained for call-signature compatibility but is no
+    # longer used: OpenAlex removed the mailto polite pool on 2026-02-13.
+    params = dict(params or {})
+    api_key = get_api_key()
+    if api_key:
+        params["api_key"] = api_key
+
+    headers = {"User-Agent": "PaperTracker/1.0"}
     url = f"{BASE_URL}/{endpoint}"
+    last_status = None
+
     for attempt in range(3):
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=30)
+            last_status = resp.status_code
+
+            # Auth / credit problems: surface a clear message, don't retry blindly.
+            if resp.status_code in (401, 403, 429):
+                if not api_key:
+                    raise RuntimeError(
+                        "OpenAlex requires an API key since 13 Feb 2026 (the email "
+                        "'polite pool' was removed), and none was found. Add "
+                        "OPENALEX_API_KEY to your Streamlit secrets, or paste a key in "
+                        "the sidebar. Get a free key at "
+                        "https://openalex.org/settings/api"
+                    )
+                detail = ""
+                try:
+                    detail = resp.json().get("message", "")
+                except Exception:
+                    detail = resp.text[:200]
+                raise RuntimeError(
+                    f"OpenAlex returned HTTP {resp.status_code} — rate limit or daily "
+                    f"budget exceeded. {detail}".strip()
+                )
+
             resp.raise_for_status()
             return resp.json()
+        except RuntimeError:
+            # Our own explanatory errors above — propagate immediately.
+            raise
         except requests.exceptions.RequestException as e:
             if attempt < 2:
                 time.sleep(2 ** attempt)
             else:
-                raise RuntimeError(f"OpenAlex request failed after 3 attempts: {e}")
+                raise RuntimeError(
+                    f"OpenAlex request failed after 3 attempts "
+                    f"(last HTTP status: {last_status}): {e}"
+                )
 
 
 def reconstruct_abstract(inverted_index: dict) -> str:
@@ -690,6 +749,26 @@ def get_included_csv(edited_df, full_df):
 
 st.title("📚 OpenAlex Paper Tracker")
 
+# ── OpenAlex API key (shared by both tabs) ─────────────────────────────────────
+# Required since 13 Feb 2026. The key is read from this input first, then from
+# app secrets (OPENALEX_API_KEY), via get_api_key().
+with st.sidebar:
+    st.header("🔑 OpenAlex API")
+    st.text_input(
+        "API key",
+        type="password",
+        key="openalex_api_key",
+        help="Required since 13 Feb 2026. Get a free key at "
+             "openalex.org/settings/api",
+    )
+    if get_api_key():
+        st.caption("✅ A key is set (input or app secrets).")
+    else:
+        st.caption(
+            "⚠️ No key found. Paste one above, or add `OPENALEX_API_KEY` to "
+            "`.streamlit/secrets.toml`."
+        )
+
 mode_keyword, mode_lookup = st.tabs([
     "🔍 Keyword Search",
     "📄 Title Lookup",
@@ -715,12 +794,12 @@ with mode_keyword:
                 help="Company name, instrument name, or keyword to search for.",
             )
         with kw_col2:
-            polite_email = st.text_input(
-                "Email (OpenAlex polite pool)",
-                value="",
-                help="Optional. Faster rate limits.",
-                key="kw_email",
-            )
+            # OpenAlex removed the email "polite pool" on 2026-02-13; the key
+            # is now set in the sidebar (or app secrets). Variable kept as ""
+            # so existing call sites that pass `polite_email` still work.
+            polite_email = ""
+            st.markdown("**Authentication**")
+            st.caption("🔑 Set your OpenAlex API key in the sidebar.")
 
         dc1, dc2 = st.columns(2)
         with dc1:
@@ -908,10 +987,12 @@ with mode_lookup:
                 help="The CSV must have a column containing paper titles.",
             )
         with lu_col2:
-            lu_email = st.text_input(
-                "Email (OpenAlex polite pool)", value="",
-                help="Optional. Faster rate limits.", key="lu_email",
-            )
+            # OpenAlex removed the email "polite pool" on 2026-02-13; the key
+            # is now set in the sidebar (or app secrets). Variable kept as ""
+            # so existing call sites that pass `lu_email` still work.
+            lu_email = ""
+            st.markdown("**Authentication**")
+            st.caption("🔑 Set your OpenAlex API key in the sidebar.")
 
         lc1, lc2 = st.columns(2)
         with lc1:
